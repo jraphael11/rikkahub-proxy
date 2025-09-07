@@ -1,66 +1,55 @@
-// mod.ts
-import { serve } from "https://deno.land/std@0.140.0/http/server.ts";
+// Deno Deploy에서 HTTP 요청을 처리하기 위한 기본 라이브러리를 가져옵니다.
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 
-// Google Gemini API의 기본 URL
-const GEMINI_API_BASE_URL = Deno.env.get("GEMINI_API_BASE_URL") |
+// Gemini API의 기본 URL입니다.
+const GEMINI_API_URL_BASE = "https://generativelanguage.googleapis.com";
 
-| "https://generativelanguage.googleapis.com";
-
-// 환경 변수에서 API 키 목록을 가져옵니다. 쉼표로 구분된 문자열이나 JSON 배열 형식을 지원합니다.
-let apiKeys: string =;
-try {
-  apiKeys = JSON.parse(Deno.env.get("API_KEYS") |
-
-| "");
-} catch {
-  apiKeys = (Deno.env.get("API_KEYS") |
-
-| "").split(',').map(k => k.trim()).filter(Boolean);
-}
-
-// 프록시 접근을 제어하기 위한 선택적 접근 토큰
-const ACCESS_TOKEN = Deno.env.get("ACCESS_TOKEN");
-
-let currentKeyIndex = 0;
-
+// 메인 함수: 들어오는 모든 요청(req)을 처리합니다.
 async function handler(req: Request): Promise<Response> {
-  // 접근 토큰이 설정된 경우, 요청 헤더에서 토큰을 확인합니다.
-  if (ACCESS_TOKEN && req.headers.get("X-Access-Token")!== ACCESS_TOKEN) {
-    return new Response("Unauthorized", { status: 401 });
+  // 1. Deno Deploy 환경 변수에서 API 키 목록 가져오기
+  // 환경 변수에 'API_KEYS'라는 이름으로 "키1,키2,키3" 처럼 콤마로 구분된 키들을 저장해야 합니다.
+  const apiKeysEnv = Deno.env.get("API_KEYS");
+  if (!apiKeysEnv) {
+    return new Response(JSON.stringify({ error: "API_KEYS environment variable is not set." }), { status: 500 });
   }
 
+  const keys = apiKeysEnv.split(',').map(key => key.trim()).filter(key => key.length > 0);
+  if (keys.length === 0) {
+    return new Response(JSON.stringify({ error: "No valid API keys found in API_KEYS env." }), { status: 500 });
+  }
+
+  // 2. API 키 로테이션: 현재 시간(초)을 기준으로 키 목록에서 하나를 무작위로 선택합니다.
+  const currentSecond = Math.floor(Date.now() / 1000);
+  const selectedKey = keys[currentSecond % keys.length];
+
+  // 3. 클라이언트 요청 URL을 Gemini API URL로 재조립
+  // 클라이언트가 "https://내Deno주소/v1beta/models/gemini-pro:generateContent"로 요청하면,
+  // Deno는 이 요청의 경로("/v1beta/...") 부분을 가져옵니다.
   const url = new URL(req.url);
-  const targetUrl = `${GEMINI_API_BASE_URL}${url.pathname}${url.search}`;
+  const targetApiUrl = `${GEMINI_API_URL_BASE}${url.pathname}`;
 
-  // 라운드 로빈 방식으로 API 키를 선택합니다.
-  const apiKey = apiKeys[currentKeyIndex];
-  currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+  // 4. 새 URL에 API 키를 쿼리 파라미터로 추가
+  const proxiedUrl = new URL(targetApiUrl);
+  proxiedUrl.searchParams.set("key", selectedKey);
 
-  const headers = new Headers(req.headers);
-  // Gemini API가 요구하는 'x-goog-api-key' 헤더에 선택된 키를 설정합니다.
-  headers.set("x-goog-api-key", apiKey);
-  // 호스트 헤더를 실제 API 호스트로 변경합니다.
-  headers.set("host", new URL(GEMINI_API_BASE_URL).host);
-
+  // 5. 클라이언트의 원본 요청(메서드, 헤더, 본문)을 그대로 사용하여 Gemini API에 전달
   try {
-    const response = await fetch(targetUrl, {
+    const geminiResponse = await fetch(proxiedUrl.toString(), {
       method: req.method,
-      headers: headers,
+      headers: req.headers,
       body: req.body,
     });
 
-    // 만약 429 (Too Many Requests) 에러가 발생하면 다음 키로 재시도하는 로직을 추가할 수 있습니다.
-    // 본 예제에서는 단순성을 위해 재시도 로직은 생략합니다.
-    // 실제 운영 환경에서는 재시도 및 키 상태 관리 로직을 추가하는 것이 좋습니다.
-
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
+    // 6. Gemini API의 응답을 다시 클라이언트(RikkaHub)에게 그대로 전달
+    return new Response(geminiResponse.body, {
+      status: geminiResponse.status,
+      headers: geminiResponse.headers,
     });
-  } catch (error) {
-    return new Response(error.toString(), { status: 500 });
+
+  } catch (err) {
+    return new Response(JSON.stringify({ error: "Failed to proxy request to Gemini", details: err.message }), { status: 502 });
   }
 }
 
+// Deno Deploy 서버를 실행하고 요청(handler)을 기다립니다.
 serve(handler);
